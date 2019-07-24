@@ -2,7 +2,6 @@ import random
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.utils.data as data
 
 import os
@@ -18,7 +17,7 @@ from Models.BERT import BertForGappedText
 from Models.Datasets import GT_Dataset, GT_collate_fn
 from Models.util import CheckpointSaver, AverageMeter, get_logger, get_save_dir, get_num_data_samples
 
-from pytorch_pretrained_bert.optimization import BertAdam, WarmupLinearSchedule
+from pytorch_transformers.optimization import AdamW, WarmupLinearSchedule
 
 
 """
@@ -162,15 +161,19 @@ def main(args, log):
         optimizer = FusedAdam(optimizer_grouped_parameters,
                               lr=args.learning_rate,
                               bias_correction=False,
-                              max_grad_norm=1.0)
+                              max_grad_norm=1.0,
+                              eps=1e-8)
         optimizer = FP16_Optimizer(optimizer, dynamic_loss_scale=True)
-        warmup_linear = WarmupLinearSchedule(warmup=args.warmup_proportion,
-                                             t_total=num_optimization_steps)
+
     else:
-        optimizer = BertAdam(optimizer_grouped_parameters,
-                             lr=args.learning_rate,
-                             warmup=args.warmup_proportion,
-                             t_total=num_optimization_steps)
+        optimizer = AdamW(optimizer_grouped_parameters,
+                          lr=args.learning_rate,
+                          correct_bias=False,
+                          eps=1e-8)
+
+    scheduler = WarmupLinearSchedule(optimizer,
+                                     warmup_steps=int(num_optimization_steps * args.warmup_proportion),
+                                     t_total=num_optimization_steps)
 
     global_step = 0
     samples_processed = 0
@@ -209,12 +212,14 @@ def main(args, log):
                 input_ids, token_type_ids, attention_mask, word_mask, gap_ids, target_gaps = batch
                 current_batch_size = input_ids.shape[0]
 
-                loss = model(input_ids=input_ids,
-                             token_type_ids=token_type_ids,
-                             attention_mask=attention_mask,
-                             word_mask=word_mask,
-                             gap_ids=gap_ids,
-                             target_gaps=target_gaps)
+                outputs = model(input_ids=input_ids,
+                                token_type_ids=token_type_ids,
+                                attention_mask=attention_mask,
+                                word_mask=word_mask,
+                                gap_ids=gap_ids,
+                                target_gaps=target_gaps)
+
+                loss = outputs[0]
 
                 if len(args.gpu_ids) > 1:
                     loss = loss.mean()
@@ -234,20 +239,14 @@ def main(args, log):
                 progress_bar.update(current_batch_size)
 
                 if step % args.accumulation_steps == 0:
-                    if args.fp16:
-                        # modify learning rate with special warm up BERT uses
-                        # if args.fp16 is False, BertAdam is used that handles this automatically
-                        current_lr = args.learning_rate * warmup_linear.get_lr(global_step, args.warmup_proportion)
-                        for param_group in optimizer.param_groups:
-                            param_group['lr'] = current_lr
+                    scheduler.step()
                     optimizer.step()
                     optimizer.zero_grad()
                     global_step += 1
 
                     # Log info
-                    if not args.fp16:
-                        current_lr = optimizer.get_lr()[0]
-                    progress_bar.set_postfix(epoch=epoch, loss=loss_val, lr=current_lr)
+                    current_lr = optimizer.param_groups[0]['lr']
+                    progress_bar.set_postfix(epoch=epoch, loss=loss_val, step=global_step, lr=current_lr)
                     tbx_writer.add_scalar('train/Loss', loss_val, global_step)
                     tbx_writer.add_scalar('train/LR', current_lr, global_step)
                     loss_val = 0
@@ -308,14 +307,14 @@ def evaluate(model, data_loader, device):
             input_ids, token_type_ids, attention_mask, word_mask, gap_ids, target_gaps = batch
             current_batch_size = input_ids.shape[0]
 
-            gap_scores = model(input_ids=input_ids,
-                               token_type_ids=token_type_ids,
-                               attention_mask=attention_mask,
-                               word_mask=word_mask,
-                               gap_ids=gap_ids,
-                               target_gaps=None)
+            outputs = model(input_ids=input_ids,
+                            token_type_ids=token_type_ids,
+                            attention_mask=attention_mask,
+                            word_mask=word_mask,
+                            gap_ids=gap_ids,
+                            target_gaps=target_gaps)
 
-            loss = F.cross_entropy(input=gap_scores, target=target_gaps)
+            loss, gap_scores = outputs[:2]
             loss_meter.update(loss.item(), current_batch_size)
 
             preds = torch.argmax(gap_scores, dim=1)
