@@ -18,7 +18,7 @@ from models.bert import BertForGappedText
 from models.datasets import GT_Dataset, GT_collate_fn
 from utils.utils_gt import CheckpointSaver, AverageMeter, get_logger, get_save_dir, get_num_data_samples
 
-from pytorch_pretrained_bert.optimization import BertAdam, WarmupLinearSchedule
+from models.optimizer import BertAdam, WarmupLinearSchedule
 
 
 """
