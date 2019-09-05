@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from pytorch_transformers.modeling_bert import BertModel, BertPreTrainedModel, gelu
+from pytorch_transformers.modeling_bert import BertModel, BertPreTrainedModel, gelu, BertLayerNorm
 from fairseq.models.roberta import RobertaModel
 
 
@@ -21,6 +21,8 @@ class BertGTHead(nn.Module):
                 self.gap_linear_2 = nn.Linear(hidden_size, 1)
                 self.cls_linear_1 = nn.Linear(3 * hidden_size, hidden_size)
                 self.cls_linear_2 = nn.Linear(hidden_size, 1)
+                self.GapLayerNorm = BertLayerNorm(hidden_size, eps=1.0e-12)
+                self.ClsLayerNorm = BertLayerNorm(hidden_size, eps=1.0e-12)
         else:
             if not two_layers:
                 self.gap_features_2_scores = nn.Linear(hidden_size, 1)
@@ -30,6 +32,8 @@ class BertGTHead(nn.Module):
                 self.gap_linear_2 = nn.Linear(hidden_size, 1)
                 self.cls_linear_1 = nn.Linear(hidden_size, hidden_size)
                 self.cls_linear_2 = nn.Linear(hidden_size, 1)
+                self.GapLayerNorm = BertLayerNorm(hidden_size, eps=1.0e-12)
+                self.ClsLayerNorm = BertLayerNorm(hidden_size, eps=1.0e-12)
 
     def forward(self, sequence_output, pooled_output, token_type_ids, word_mask, gap_ids):
         batch_size, seq_len, _ = sequence_output.shape
@@ -84,8 +88,8 @@ class BertGTHead(nn.Module):
             gap_scores = self.gap_features_2_scores(gap_features).squeeze(-1)
             cls_scores = self.cls_features_2_scores(cls_features).squeeze(-1)
         else:
-            gap_scores = self.gap_linear_2(gelu(self.gap_linear_1(gap_features))).squeeze(-1)
-            cls_scores = self.cls_linear_2(gelu(self.cls_linear_1(cls_features))).squeeze(-1)
+            gap_scores = self.gap_linear_2(self.GapLayerNorm(gelu(self.gap_linear_1(gap_features)))).squeeze(-1)
+            cls_scores = self.cls_linear_2(self.ClsLayerNorm(gelu(self.cls_linear_1(cls_features)))).squeeze(-1)
 
         scores = torch.cat((cls_scores, gap_scores), dim=1)
 
@@ -191,6 +195,10 @@ class RobertaForGappedText(nn.Module):
             self.output_layer.cls_linear_2.weight.data.normal_(mean=0.0, std=0.02)
             self.output_layer.gap_linear_2.bias.data.zero_()
             self.output_layer.cls_linear_2.bias.data.zero_()
+            self.output_layer.GapLayerNorm.weight.data.fill_(1.0)
+            self.output_layer.GapLayerNorm.bias.data.zero_()
+            self.output_layer.ClsLayerNorm.weight.data.fill_(1.0)
+            self.output_layer.ClsLayerNorm.bias.data.zero_()
 
     def forward(self, input_ids, token_type_ids, attention_mask, word_mask, gap_ids, target_gaps=None, position_ids=None, head_mask=None, use_output_head=False):
         outputs = self.roberta(src_tokens=input_ids,
