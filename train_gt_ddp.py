@@ -14,7 +14,7 @@ from collections import OrderedDict
 from tensorboardX import SummaryWriter
 from tqdm import tqdm
 
-from models.bert import BertForGappedText, RobertaForGappedText, BertForGappedTextNoWindowPooling
+from models.bert import BertForGappedText, RobertaForGappedText, BertForGappedTextNoWindowPooling, BertForGappedTextTwoLayers
 from models.optimizer import BertAdam
 from utils.datasets_gt import GT_Dataset, GT_collate_fn
 from utils.utils_gt import CheckpointSaver, AverageMeter, get_logger, get_save_dir, get_num_data_samples
@@ -98,6 +98,9 @@ def get_args():
     parser.add_argument("--window_size",
                         type=int,
                         default=15)
+    parser.add_argument('--two_layers',
+                        type=lambda s: s.lower().startswith('t'),
+                        default=False)
 
     args = parser.parse_args()
 
@@ -137,12 +140,14 @@ def train(args, log, tb_writer):
     log.info(f'Using architecture {args.model_type}.')
     log.info(f'Loading model {args.model}...')
     if args.model_type == 'bert-base-uncased':
-        if args.window_size > 0:
-            model = BertForGappedText.from_pretrained(args.model)
-        else:
+        if args.window_size <= 0:
             model = BertForGappedTextNoWindowPooling.from_pretrained(args.model)
+        elif args.two_layers:
+            model = BertForGappedTextTwoLayers.from_pretrained(args.model)
+        else:
+            model = BertForGappedText.from_pretrained(args.model)
     elif args.model_type == 'roberta':
-        model = RobertaForGappedText(args.model, window_size=args.window_size)
+        model = RobertaForGappedText(args.model, window_size=args.window_size, two_layers=args.two_layers)
     else:
         raise ValueError(f'Model architecture {args.model_type} is not found.')
 
