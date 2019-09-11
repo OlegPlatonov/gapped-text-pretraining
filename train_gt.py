@@ -13,7 +13,7 @@ from collections import OrderedDict
 from tensorboardX import SummaryWriter
 from tqdm import tqdm
 
-from models.bert import BertForGappedText, RobertaForGappedText, BertForGappedTextNoWindowPooling, BertForGappedTextTwoLayers
+from models.bert import BertForGappedText, RobertaForGappedText, BertForGappedTextNoWindowPooling, BertForGappedTextTwoLayers, BertForGappedTextNoClsPool
 from models.optimizer import BertAdam, WarmupLinearSchedule
 from utils.datasets_gt import GT_Dataset, GT_collate_fn
 from utils.utils_gt import CheckpointSaver, AverageMeter, get_logger, get_save_dir, get_num_data_samples
@@ -145,9 +145,14 @@ def train(args, log, tb_writer):
     log.info(f'Loading model {args.model}...')
     if args.model_type == 'bert-base-uncased':
         if args.window_size <= 0:
+            log.info("Not using window pooling...")
             model = BertForGappedTextNoWindowPooling.from_pretrained(args.model)
         elif args.two_layers:
+            log.info("Using 2 output layers...")
             model = BertForGappedTextTwoLayers.from_pretrained(args.model)
+        elif not args.use_output_head:
+            log.info("Not using CLS pooling...")
+            model = BertForGappedTextNoClsPool.from_pretrained(args.model)
         else:
             model = BertForGappedText.from_pretrained(args.model)
     elif args.model_type == 'roberta':
@@ -276,8 +281,7 @@ def train(args, log, tb_writer):
                                 attention_mask=attention_mask,
                                 word_mask=word_mask,
                                 gap_ids=gap_ids,
-                                target_gaps=target_gaps,
-                                use_output_head=args.use_output_head)
+                                target_gaps=target_gaps)
 
                 loss = outputs[0]
 

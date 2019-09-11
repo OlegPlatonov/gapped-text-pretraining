@@ -146,18 +146,14 @@ class BertForGappedText(BertPreTrainedModel):
         self.output_layer = BertGTHead(config.hidden_size, window_size=window_size)
         self.apply(self.init_weights)
 
-    def forward(self, input_ids, token_type_ids, attention_mask, word_mask, gap_ids, target_gaps=None, position_ids=None, head_mask=None, use_output_head=True):
+    def forward(self, input_ids, token_type_ids, attention_mask, word_mask, gap_ids, target_gaps=None, position_ids=None, head_mask=None):
         outputs = self.bert(input_ids=input_ids,
                             token_type_ids=token_type_ids,
                             attention_mask=attention_mask,
                             position_ids=position_ids,
                             head_mask=head_mask)
 
-        if use_output_head:
-            sequence_output, pooled_output = outputs[:2]
-        else:
-            sequence_output = outputs[0]
-            pooled_output = None
+        sequence_output, pooled_output = outputs[:2]
 
         gap_scores = self.output_layer(sequence_output=sequence_output,
                                        pooled_output=pooled_output,
@@ -200,7 +196,7 @@ class RobertaForGappedText(nn.Module):
             self.output_layer.ClsLayerNorm.weight.data.fill_(1.0)
             self.output_layer.ClsLayerNorm.bias.data.zero_()
 
-    def forward(self, input_ids, token_type_ids, attention_mask, word_mask, gap_ids, target_gaps=None, position_ids=None, head_mask=None, use_output_head=False):
+    def forward(self, input_ids, token_type_ids, attention_mask, word_mask, gap_ids, target_gaps=None, position_ids=None, head_mask=None):
         outputs = self.roberta(src_tokens=input_ids,
                                features_only=True)
 
@@ -228,19 +224,14 @@ class BertForGappedTextNoWindowPooling(BertPreTrainedModel):
         self.output_layer = BertGTHead(config.hidden_size, window_size=0)
         self.apply(self.init_weights)
 
-    def forward(self, input_ids, token_type_ids, attention_mask, word_mask, gap_ids, target_gaps=None, position_ids=None, head_mask=None,
-                use_output_head=True):
+    def forward(self, input_ids, token_type_ids, attention_mask, word_mask, gap_ids, target_gaps=None, position_ids=None, head_mask=None):
         outputs = self.bert(input_ids=input_ids,
                             token_type_ids=token_type_ids,
                             attention_mask=attention_mask,
                             position_ids=position_ids,
                             head_mask=head_mask)
 
-        if use_output_head:
-            sequence_output, pooled_output = outputs[:2]
-        else:
-            sequence_output = outputs[0]
-            pooled_output = None
+        sequence_output, pooled_output = outputs[:2]
 
         gap_scores = self.output_layer(sequence_output=sequence_output,
                                        pooled_output=pooled_output,
@@ -264,22 +255,47 @@ class BertForGappedTextTwoLayers(BertPreTrainedModel):
         self.output_layer = BertGTHead(config.hidden_size, window_size=window_size, two_layers=True)
         self.apply(self.init_weights)
 
-    def forward(self, input_ids, token_type_ids, attention_mask, word_mask, gap_ids, target_gaps=None, position_ids=None, head_mask=None,
-                use_output_head=True):
+    def forward(self, input_ids, token_type_ids, attention_mask, word_mask, gap_ids, target_gaps=None, position_ids=None, head_mask=None):
         outputs = self.bert(input_ids=input_ids,
                             token_type_ids=token_type_ids,
                             attention_mask=attention_mask,
                             position_ids=position_ids,
                             head_mask=head_mask)
 
-        if use_output_head:
-            sequence_output, pooled_output = outputs[:2]
-        else:
-            sequence_output = outputs[0]
-            pooled_output = None
+        sequence_output, pooled_output = outputs[:2]
 
         gap_scores = self.output_layer(sequence_output=sequence_output,
                                        pooled_output=pooled_output,
+                                       token_type_ids=token_type_ids,
+                                       word_mask=word_mask,
+                                       gap_ids=gap_ids)
+
+        outputs = (gap_scores,) + outputs[2:]
+
+        if target_gaps is not None:
+            loss = F.cross_entropy(input=gap_scores, target=target_gaps)
+            outputs = (loss,) + outputs
+
+        return outputs
+
+class BertForGappedTextNoClsPool(BertPreTrainedModel):
+    def __init__(self, config, window_size=15):
+        super(BertForGappedTextNoClsPool, self).__init__(config)
+        self.bert = BertModel(config)
+        self.output_layer = BertGTHead(config.hidden_size, window_size=window_size)
+        self.apply(self.init_weights)
+
+    def forward(self, input_ids, token_type_ids, attention_mask, word_mask, gap_ids, target_gaps=None, position_ids=None, head_mask=None):
+        outputs = self.bert(input_ids=input_ids,
+                            token_type_ids=token_type_ids,
+                            attention_mask=attention_mask,
+                            position_ids=position_ids,
+                            head_mask=head_mask)
+
+        sequence_output, pooled_output = outputs[:2]
+
+        gap_scores = self.output_layer(sequence_output=sequence_output,
+                                       pooled_output=None,
                                        token_type_ids=token_type_ids,
                                        word_mask=word_mask,
                                        gap_ids=gap_ids)
