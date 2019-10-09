@@ -217,93 +217,42 @@ class RobertaForGappedText(nn.Module):
         return outputs
 
 
-class BertForGappedTextNoWindowPooling(BertPreTrainedModel):
-    def __init__(self, config, window_size=0):
-        super(BertForGappedTextNoWindowPooling, self).__init__(config)
-        self.bert = BertModel(config)
-        self.output_layer = BertGTHead(config.hidden_size, window_size=0)
-        self.apply(self.init_weights)
+class BertSOPHead(nn.Module):
+    def __init__(self, hidden_size):
+        super(BertSOPHead, self).__init__()
+        self.linear = nn.Linear(hidden_size, hidden_size)
+        self.output_proj = nn.Linear(hidden_size, 2)
 
-    def forward(self, input_ids, token_type_ids, attention_mask, word_mask, gap_ids, target_gaps=None, position_ids=None, head_mask=None):
-        outputs = self.bert(input_ids=input_ids,
-                            token_type_ids=token_type_ids,
-                            attention_mask=attention_mask,
-                            position_ids=position_ids,
-                            head_mask=head_mask)
+    def forward(self, sequence_output):
+        hidden = gelu(self.linear(sequence_output[:, 0]))
+        scores = self.output_proj(hidden)
 
-        sequence_output, pooled_output = outputs[:2]
+        return scores
 
-        gap_scores = self.output_layer(sequence_output=sequence_output,
-                                       pooled_output=pooled_output,
-                                       token_type_ids=token_type_ids,
-                                       word_mask=word_mask,
-                                       gap_ids=gap_ids)
+class RobertaForSOP(nn.Module):
+    def __init__(self, model_path):
+        super(RobertaForSOP, self).__init__()
+        self.roberta = RobertaModel.from_pretrained(model_path).model
+        self.config = vars(self.roberta.args)
+        self.output_layer = BertSOPHead(self.roberta.args.encoder_embed_dim)
 
-        outputs = (gap_scores,) + outputs[2:]
+        self.output_layer.linear.weight.data.normal_(mean=0.0, std=0.02)
+        self.output_layer.output_proj.weight.data.normal_(mean=0.0, std=0.02)
+        self.output_layer.linear.bias.data.zero_()
+        self.output_layer.output_proj.bias.data.zero_()
 
-        if target_gaps is not None:
-            loss = F.cross_entropy(input=gap_scores, target=target_gaps)
-            outputs = (loss,) + outputs
+    def forward(self, input_ids, token_type_ids, attention_mask, targets=None):
+        outputs = self.roberta(src_tokens=input_ids,
+                               features_only=True)
 
-        return outputs
+        sequence_output = outputs[0]
 
+        scores = self.output_layer(sequence_output=sequence_output)
 
-class BertForGappedTextTwoLayers(BertPreTrainedModel):
-    def __init__(self, config, window_size=15):
-        super(BertForGappedTextTwoLayers, self).__init__(config)
-        self.bert = BertModel(config)
-        self.output_layer = BertGTHead(config.hidden_size, window_size=window_size, two_layers=True)
-        self.apply(self.init_weights)
+        outputs = (scores,)
 
-    def forward(self, input_ids, token_type_ids, attention_mask, word_mask, gap_ids, target_gaps=None, position_ids=None, head_mask=None):
-        outputs = self.bert(input_ids=input_ids,
-                            token_type_ids=token_type_ids,
-                            attention_mask=attention_mask,
-                            position_ids=position_ids,
-                            head_mask=head_mask)
-
-        sequence_output, pooled_output = outputs[:2]
-
-        gap_scores = self.output_layer(sequence_output=sequence_output,
-                                       pooled_output=pooled_output,
-                                       token_type_ids=token_type_ids,
-                                       word_mask=word_mask,
-                                       gap_ids=gap_ids)
-
-        outputs = (gap_scores,) + outputs[2:]
-
-        if target_gaps is not None:
-            loss = F.cross_entropy(input=gap_scores, target=target_gaps)
-            outputs = (loss,) + outputs
-
-        return outputs
-
-class BertForGappedTextNoClsPool(BertPreTrainedModel):
-    def __init__(self, config, window_size=15):
-        super(BertForGappedTextNoClsPool, self).__init__(config)
-        self.bert = BertModel(config)
-        self.output_layer = BertGTHead(config.hidden_size, window_size=window_size)
-        self.apply(self.init_weights)
-
-    def forward(self, input_ids, token_type_ids, attention_mask, word_mask, gap_ids, target_gaps=None, position_ids=None, head_mask=None):
-        outputs = self.bert(input_ids=input_ids,
-                            token_type_ids=token_type_ids,
-                            attention_mask=attention_mask,
-                            position_ids=position_ids,
-                            head_mask=head_mask)
-
-        sequence_output, pooled_output = outputs[:2]
-
-        gap_scores = self.output_layer(sequence_output=sequence_output,
-                                       pooled_output=None,
-                                       token_type_ids=token_type_ids,
-                                       word_mask=word_mask,
-                                       gap_ids=gap_ids)
-
-        outputs = (gap_scores,) + outputs[2:]
-
-        if target_gaps is not None:
-            loss = F.cross_entropy(input=gap_scores, target=target_gaps)
+        if targets is not None:
+            loss = F.cross_entropy(input=scores, target=targets)
             outputs = (loss,) + outputs
 
         return outputs

@@ -14,9 +14,9 @@ from collections import OrderedDict
 from tensorboardX import SummaryWriter
 from tqdm import tqdm
 
-from models.bert import BertForGappedText, RobertaForGappedText, BertForGappedTextNoWindowPooling, BertForGappedTextTwoLayers, BertForGappedTextNoClsPool
+from models.bert import BertForGappedText, RobertaForGappedText, RobertaForSOP
 from models.optimizer import BertAdam, WarmupLinearSchedule
-from utils.datasets_gt import GT_Dataset, GT_collate_fn
+from utils.datasets_gt import GT_Dataset, GT_collate_fn, SOP_Dataset, SOP_collate_fn
 from utils.utils_gt import CheckpointSaver, AverageMeter, get_logger, get_save_dir, get_num_data_samples
 
 
@@ -39,6 +39,10 @@ def get_args():
                         type=str,
                         default='bert-base-uncased',
                         help='Pretrained model name or path.')
+    parser.add_argument('--task',
+                        default='GT',
+                        choices=['GT', 'SOP'],
+                        help='Training task.')
     parser.add_argument('--save_dir',
                         type=str,
                         default='./experiments',
@@ -96,9 +100,6 @@ def get_args():
                         type=int,
                         default=-1,
                         help='Local rank for distributed training.')
-    parser.add_argument('--use_output_head',
-                        type=lambda s: s.lower().startswith('t'),
-                        default=True)
     parser.add_argument("--window_size",
                         type=int,
                         default=15)
@@ -144,19 +145,17 @@ def train(args, log, tb_writer):
     log.info(f'Using architecture {args.model_type}.')
     log.info(f'Loading model {args.model}...')
     if args.model_type == 'bert-base-uncased':
-        if args.window_size <= 0:
-            log.info("Not using window pooling...")
-            model = BertForGappedTextNoWindowPooling.from_pretrained(args.model)
-        elif args.two_layers:
-            log.info("Using 2 output layers...")
-            model = BertForGappedTextTwoLayers.from_pretrained(args.model)
-        elif not args.use_output_head:
-            log.info("Not using CLS pooling...")
-            model = BertForGappedTextNoClsPool.from_pretrained(args.model)
-        else:
+        if args.task == 'GT':
             model = BertForGappedText.from_pretrained(args.model)
+        else:
+            raise ValueError(f'Unsupported task: {args.task}.')
     elif args.model_type == 'roberta':
-        model = RobertaForGappedText(args.model, window_size=args.window_size, two_layers=args.two_layers)
+        if args.task == 'GT':
+            model = RobertaForGappedText(args.model, window_size=args.window_size, two_layers=args.two_layers)
+        elif args.task == 'SOP':
+            model = RobertaForSOP(args.model)
+        else:
+            raise ValueError(f'Unsupported task: {args.task}.')
     else:
         raise ValueError(f'Model architecture {args.model_type} is not found.')
 
@@ -218,16 +217,19 @@ def train(args, log, tb_writer):
                              warmup=args.warmup_proportion,
                              t_total=num_optimization_steps)
 
+    Dataset = GT_Dataset if args.task == 'GT' else SOP_Dataset
+    collate_fn = GT_collate_fn if args.task == 'GT' else SOP_collate_fn
+
     # Get dev data loader
     dev_data_file = os.path.join(args.data_dir, f'Dev.csv')
     log.info(f'Creating dev dataset from {dev_data_file}...')
-    dev_dataset = GT_Dataset(dev_data_file)
+    dev_dataset = Dataset(dev_data_file)
     dev_sampler = DistributedSampler(dev_dataset)
     dev_loader = data.DataLoader(dev_dataset,
                                  batch_size=args.batch_size,
                                  sampler=dev_sampler,
                                  num_workers=1,
-                                 collate_fn=lambda batch: GT_collate_fn(batch, model_type=args.model_type))
+                                 collate_fn=lambda batch: collate_fn(batch, model_type=args.model_type))
 
     model = DistributedDataParallel(model,
                                     device_ids=[args.local_rank],
@@ -247,13 +249,13 @@ def train(args, log, tb_writer):
         train_data_file_num = ((epoch - 1) % num_unique_data_epochs) + 1
         train_data_file = os.path.join(args.data_dir, f'Epoch_{train_data_file_num}.csv')
         log.info(f'Creating training dataset from {train_data_file}...')
-        train_dataset = GT_Dataset(train_data_file)
+        train_dataset = Dataset(train_data_file)
         train_sampler = DistributedSampler(train_dataset)
         train_loader = data.DataLoader(train_dataset,
                                        batch_size=args.batch_size,
                                        sampler=train_sampler,
                                        num_workers=args.num_workers,
-                                       collate_fn=lambda batch: GT_collate_fn(batch, model_type=args.model_type))
+                                       collate_fn=lambda batch: collate_fn(batch, model_type=args.model_type))
 
         torch.distributed.barrier()
         log.info(f'Starting epoch {epoch}...')
@@ -263,15 +265,23 @@ def train(args, log, tb_writer):
         with torch.enable_grad(), tqdm(total=len(train_loader.dataset), disable=args.local_rank != 0) as progress_bar:
             for step, batch in enumerate(train_loader, 1):
                 batch = tuple(x.to(device) for x in batch)
-                input_ids, token_type_ids, attention_mask, word_mask, gap_ids, target_gaps = batch
-                current_batch_size = input_ids.shape[0]
 
-                outputs = model(input_ids=input_ids,
-                                token_type_ids=token_type_ids,
-                                attention_mask=attention_mask,
-                                word_mask=word_mask,
-                                gap_ids=gap_ids,
-                                target_gaps=target_gaps)
+                if args.task == 'GT':
+                    input_ids, token_type_ids, attention_mask, word_mask, gap_ids, target_gaps = batch
+                    outputs = model(input_ids=input_ids,
+                                    token_type_ids=token_type_ids,
+                                    attention_mask=attention_mask,
+                                    word_mask=word_mask,
+                                    gap_ids=gap_ids,
+                                    target_gaps=target_gaps)
+                else:
+                    input_ids, token_type_ids, attention_mask, targets = batch
+                    outputs = model(input_ids=input_ids,
+                                    token_type_ids=token_type_ids,
+                                    attention_mask=attention_mask,
+                                    targets=targets)
+
+                current_batch_size = input_ids.shape[0]
 
                 loss = outputs[0]
 
@@ -293,7 +303,7 @@ def train(args, log, tb_writer):
                     if args.fp16:
                         # modify learning rate with special warm up BERT uses
                         # if args.fp16 is False, BertAdam is used that handles this automatically
-                        current_lr = args.learning_rate * warmup_linear.get_lr(global_step, args.warmup_proportion)
+                        current_lr = args.learning_rate * warmup_linear.get_lr(global_step + 1, args.warmup_proportion)
                         for param_group in optimizer.param_groups:
                             param_group['lr'] = current_lr
                     optimizer.step()
@@ -339,6 +349,7 @@ def train(args, log, tb_writer):
 
 def evaluate_and_save(model, optimizer, data_loader, device, tb_writer, log, global_step, saver, args):
     log.info('Evaluating...')
+    evaluate = evaluate_GT if args.task == 'GT' else evaluate_SOP
     results = evaluate(model, data_loader, device)
 
     results_str = ', '.join('{}: {:05.2f}'.format(k, v)
@@ -353,11 +364,11 @@ def evaluate_and_save(model, optimizer, data_loader, device, tb_writer, log, glo
         log.info('Saving checkpoint at step {}...'.format(global_step))
         saver.save(step=global_step,
                    model=model,
-                   optimizer=optimizer,
+                   args=args,
                    metric_val=results['Accuracy'])
 
 
-def evaluate(model, data_loader, device):
+def evaluate_GT(model, data_loader, device):
     loss_meter = AverageMeter()
     world_size = torch.distributed.get_world_size()
 
@@ -398,6 +409,44 @@ def evaluate(model, data_loader, device):
                     ('Accuracy', correct_preds / total_preds),
                     ('AvNA', correct_avna / total_preds),
                     ('NA_share', zero_preds / total_preds)]
+
+    results = OrderedDict(results_list)
+
+    return results
+
+
+def evaluate_SOP(model, data_loader, device):
+    loss_meter = AverageMeter()
+    world_size = torch.distributed.get_world_size()
+
+    model.eval()
+    correct_preds = 0
+    total_preds = 0
+    with torch.no_grad(), tqdm(total=len(data_loader.dataset), disable=args.local_rank != 0) as progress_bar:
+        for batch in data_loader:
+            batch = tuple(x.to(device) for x in batch)
+            input_ids, token_type_ids, attention_mask, targets = batch
+            current_batch_size = input_ids.shape[0]
+
+            outputs = model(input_ids=input_ids,
+                            token_type_ids=token_type_ids,
+                            attention_mask=attention_mask,
+                            targets=targets)
+
+            loss, scores = outputs[:2]
+            loss_meter.update(loss.item(), current_batch_size)
+
+            correct_preds += torch.sum(torch.argmax(scores, dim=1) == targets).item()
+            total_preds += current_batch_size
+
+            # Log info
+            progress_bar.update(current_batch_size * world_size)
+            progress_bar.set_postfix(loss=loss_meter.avg)
+
+    model.train()
+
+    results_list = [('Loss', loss_meter.avg),
+                    ('Accuracy', correct_preds / total_preds)]
 
     results = OrderedDict(results_list)
 
