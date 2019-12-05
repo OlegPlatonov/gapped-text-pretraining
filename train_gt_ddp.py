@@ -242,22 +242,24 @@ def train(args, log, tb_writer):
     # Train
     log.info('Training...')
     samples_till_eval = args.eval_every
+
+    torch.distributed.barrier()
+
+    # Get train data loader
+    train_data_file_num = 1
+    train_data_file = os.path.join(args.data_dir, f'Epoch_{train_data_file_num}.csv')
+    log.info(f'Creating training dataset from {train_data_file}...')
+    train_dataset = Dataset(train_data_file)
+    train_sampler = DistributedSampler(train_dataset, shuffle=True)
+    train_loader = data.DataLoader(train_dataset,
+                                   batch_size=args.batch_size,
+                                   sampler=train_sampler,
+                                   num_workers=args.num_workers,
+                                   collate_fn=lambda batch: collate_fn(batch, model_type=args.model_type))
+
+    torch.distributed.barrier()
     for epoch in range(1, args.num_epochs + 1):
-        torch.distributed.barrier()
 
-        # Get train data loader for current epoch
-        train_data_file_num = ((epoch - 1) % num_unique_data_epochs) + 1
-        train_data_file = os.path.join(args.data_dir, f'Epoch_{train_data_file_num}.csv')
-        log.info(f'Creating training dataset from {train_data_file}...')
-        train_dataset = Dataset(train_data_file)
-        train_sampler = DistributedSampler(train_dataset)
-        train_loader = data.DataLoader(train_dataset,
-                                       batch_size=args.batch_size,
-                                       sampler=train_sampler,
-                                       num_workers=args.num_workers,
-                                       collate_fn=lambda batch: collate_fn(batch, model_type=args.model_type))
-
-        torch.distributed.barrier()
         log.info(f'Starting epoch {epoch}...')
         model.train()
         optimizer.zero_grad()
