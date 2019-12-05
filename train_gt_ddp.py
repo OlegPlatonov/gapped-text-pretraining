@@ -250,7 +250,7 @@ def train(args, log, tb_writer):
     train_data_file = os.path.join(args.data_dir, f'Epoch_{train_data_file_num}.csv')
     log.info(f'Creating training dataset from {train_data_file}...')
     train_dataset = Dataset(train_data_file)
-    train_sampler = DistributedSampler(train_dataset, shuffle=True)
+    train_sampler = DistributedSampler(train_dataset)
     train_loader = data.DataLoader(train_dataset,
                                    batch_size=args.batch_size,
                                    sampler=train_sampler,
