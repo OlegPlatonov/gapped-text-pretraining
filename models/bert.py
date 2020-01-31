@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from transformers import RobertaModel
+from transformers.modeling_roberta import RobertaModel, RobertaLMHead
 from transformers.configuration_roberta import RobertaConfig
 from transformers.modeling_bert import BertPreTrainedModel
 
@@ -50,6 +50,7 @@ class RobertaForGappedText(BertPreTrainedModel):
         super(RobertaForGappedText, self).__init__(config)
         self.roberta = RobertaModel(config)
         self.gt_head = GT_Head(config.hidden_size)
+        self.lm_head = RobertaLMHead(config)
 
         self.init_weights()
 
@@ -58,7 +59,9 @@ class RobertaForGappedText(BertPreTrainedModel):
         input_ids,
         attention_mask,
         gap_ids,
+        mask_ids,
         target_gaps=None,
+        mask_targets=None
     ):
 
         outputs = self.roberta(
@@ -70,10 +73,15 @@ class RobertaForGappedText(BertPreTrainedModel):
 
         gap_scores = self.gt_head(sequence_output=sequence_output, gap_ids=gap_ids)
 
-        outputs = (gap_scores,) + outputs[2:]
+        mask_representations = sequence_output[mask_ids[:, 0], mask_ids[:, 1]]
+        mask_scores = self.lm_head(mask_representations)
 
-        if target_gaps is not None:
-            loss = F.cross_entropy(input=gap_scores, target=target_gaps)
-            outputs = (loss,) + outputs
+        outputs = (gap_scores, mask_scores) + outputs[2:]
+
+        if target_gaps is not None and mask_targets is not None:
+            gt_loss = F.cross_entropy(input=gap_scores, target=target_gaps)
+            lm_loss = F.cross_entropy(input=mask_scores, target=mask_targets)
+
+            outputs = (gt_loss, lm_loss) + outputs
 
         return outputs

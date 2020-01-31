@@ -97,8 +97,12 @@ def get_args():
                         choices=['O0', 'O1', 'O2', 'O3'],
                         help='Apex optimization level. Only used if fp16 is True.')
     parser.add_argument("--weight_decay",
-                        default=0.0,
+                        default=0,
                         type=float)
+    parser.add_argument("--mask_proportion",
+                        default=0,
+                        type=float,
+                        help='Proportion of words to mask in the input.')
     parser.add_argument("--local_rank",
                         type=int,
                         default=-1,
@@ -195,10 +199,10 @@ def train(args, log, tb_writer):
     dev_dataset = GT_Dataset(dev_data_file)
     dev_sampler = sampler(dev_dataset)
     dev_loader = DataLoader(dev_dataset,
-                                 batch_size=args.batch_size,
-                                 sampler=dev_sampler,
-                                 num_workers=args.num_workers,
-                                 collate_fn=GT_collate_fn)
+                             batch_size=args.batch_size,
+                             sampler=dev_sampler,
+                             num_workers=args.num_workers,
+                             collate_fn=lambda batch: GT_collate_fn(batch, args.mask_proportion))
 
 
     global_step = 0
@@ -218,10 +222,10 @@ def train(args, log, tb_writer):
         train_dataset = GT_Dataset(train_data_file)
         train_sampler = sampler(train_dataset)
         train_loader = DataLoader(train_dataset,
-                                       batch_size=args.batch_size,
-                                       sampler=train_sampler,
-                                       num_workers=args.num_workers,
-                                       collate_fn=GT_collate_fn)
+                                   batch_size=args.batch_size,
+                                   sampler=train_sampler,
+                                   num_workers=args.num_workers,
+                                   collate_fn=lambda batch: GT_collate_fn(batch, args.mask_proportion))
 
         if args.local_rank != -1:
             torch.distributed.barrier()
@@ -229,25 +233,32 @@ def train(args, log, tb_writer):
         log.info(f'Starting epoch {epoch}...')
         model.train()
         model.zero_grad()
-        loss_val = 0
+        gt_loss_val = 0
+        lm_loss_val = 0
         with torch.enable_grad(), tqdm(total=len(train_loader.dataset), disable=args.local_rank not in [-1, 0]) as progress_bar:
             for step, batch in enumerate(train_loader, 1):
                 batch = tuple(x.to(device) for x in batch)
 
-                input_ids, token_type_ids, attention_mask, word_mask, gap_ids, target_gaps = batch
+                input_ids, token_type_ids, attention_mask, word_mask, gap_ids, target_gaps, mask_ids, mask_targets = batch
                 outputs = model(input_ids=input_ids,
                                 attention_mask=attention_mask,
                                 gap_ids=gap_ids,
-                                target_gaps=target_gaps)
+                                target_gaps=target_gaps,
+                                mask_ids=mask_ids,
+                                mask_targets=mask_targets)
 
                 current_batch_size = input_ids.shape[0]
 
-                loss = outputs[0]
+                gt_loss, lm_loss = outputs[:2]
 
                 if args.accumulation_steps > 1:
-                    loss = loss / args.accumulation_steps
+                    gt_loss = gt_loss / args.accumulation_steps
+                    lm_loss = lm_loss / args.accumulation_steps
 
-                loss_val += loss.item()
+                gt_loss_val += gt_loss.item()
+                lm_loss_val += lm_loss.item()
+
+                loss = gt_loss + lm_loss
 
                 if args.fp16:
                     with amp.scale_loss(loss, optimizer) as scaled_loss:
@@ -272,11 +283,13 @@ def train(args, log, tb_writer):
 
                     # Log info
                     current_lr = scheduler.get_lr()[0]
-                    progress_bar.set_postfix(epoch=epoch, loss=loss_val, step=global_step, lr=current_lr)
+                    progress_bar.set_postfix(epoch=epoch, gt_loss=gt_loss_val, lm_loss=lm_loss_val, step=global_step, lr=current_lr)
                     if args.local_rank in [-1, 0]:
-                        tb_writer.add_scalar('train/Loss', loss_val, global_step)
+                        tb_writer.add_scalar('train/Loss', gt_loss_val, global_step)
+                        tb_writer.add_scalar('train/LM_loss', lm_loss_val, global_step)
                         tb_writer.add_scalar('train/LR', current_lr, global_step)
-                    loss_val = 0
+                    gt_loss_val = 0
+                    lm_loss_val = 0
 
                     if global_step == args.max_steps:
                         log.info('Reached maximum number of optimization steps.')
@@ -327,7 +340,8 @@ def evaluate_and_save(model, optimizer, data_loader, device, tb_writer, log, glo
 
 
 def evaluate_GT(model, data_loader, device):
-    loss_meter = AverageMeter()
+    gt_loss_meter = AverageMeter()
+    lm_loss_meter = AverageMeter()
     world_size = torch.distributed.get_world_size() if args.local_rank != -1 else 1
 
     model.eval()
@@ -335,19 +349,24 @@ def evaluate_GT(model, data_loader, device):
     correct_avna = 0
     zero_preds = 0
     total_preds = 0
+    correct_mask_preds = 0
+    total_mask_preds = 0
     with torch.no_grad(), tqdm(total=len(data_loader.dataset), disable=args.local_rank not in [-1, 0]) as progress_bar:
         for batch in data_loader:
             batch = tuple(x.to(device) for x in batch)
-            input_ids, token_type_ids, attention_mask, word_mask, gap_ids, target_gaps = batch
+            input_ids, token_type_ids, attention_mask, word_mask, gap_ids, target_gaps, mask_ids, mask_targets = batch
             current_batch_size = input_ids.shape[0]
 
             outputs = model(input_ids=input_ids,
                             attention_mask=attention_mask,
                             gap_ids=gap_ids,
-                            target_gaps=target_gaps)
+                            target_gaps=target_gaps,
+                            mask_ids=mask_ids,
+                            mask_targets=mask_targets)
 
-            loss, gap_scores = outputs[:2]
-            loss_meter.update(loss.item(), current_batch_size)
+            gt_loss, lm_loss, gap_scores, mask_scores = outputs[:4]
+            gt_loss_meter.update(gt_loss.item(), current_batch_size)
+            lm_loss_meter.update(lm_loss.item(), mask_scores.shape[0])
 
             preds = torch.argmax(gap_scores, dim=1)
             correct_preds += torch.sum(preds == target_gaps).item()
@@ -355,16 +374,22 @@ def evaluate_GT(model, data_loader, device):
             zero_preds += torch.sum(preds == 0).item()
             total_preds += current_batch_size
 
+            mask_preds = torch.argmax(mask_scores, dim=1)
+            correct_mask_preds += torch.sum(mask_preds == mask_targets).item()
+            total_mask_preds += mask_preds.shape[0]
+
             # Log info
             progress_bar.update(current_batch_size * world_size)
-            progress_bar.set_postfix(loss=loss_meter.avg)
+            progress_bar.set_postfix(gt_loss=gt_loss_meter.avg, lm_loss=lm_loss_meter.avg)
 
     model.train()
 
-    results_list = [('Loss', loss_meter.avg),
+    results_list = [('Loss', gt_loss_meter.avg),
                     ('Accuracy', correct_preds / total_preds),
                     ('AvNA', correct_avna / total_preds),
-                    ('NA_share', zero_preds / total_preds)]
+                    ('NA_share', zero_preds / total_preds),
+                    ('LM_loss', lm_loss_meter.avg),
+                    ('LM_accuracy', correct_mask_preds / total_mask_preds)]
 
     results = OrderedDict(results_list)
 

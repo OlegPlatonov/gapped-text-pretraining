@@ -1,3 +1,4 @@
+import random
 import pandas as pd
 import torch
 import torch.utils.data as data
@@ -18,8 +19,8 @@ tokenizers = {
 }
 
 special_tokens = {
-    'bert-base-uncased': ['[PAD]', '[UNK]', '[CLS]', '[SEP]', '[MASK]', '[GAP]'],
-    'roberta': ['<s>', '<pad>', '</s>', '<unk>', '<mask>', '<gap>']
+    'bert-base-uncased': ['[PAD]', '[UNK]', '[CLS]', '[SEP]', '[GAP]'],
+    'roberta': ['<s>', '<pad>', '</s>', '<unk>', '<gap>']
 }
 
 special_token_ids = {
@@ -45,6 +46,11 @@ gap_token_ids = {
 pad_token_ids = {
     'bert-base-uncased': tokenizers['bert-base-uncased'].convert_tokens_to_ids(['[PAD]'])[0],
     'roberta': tokenizers['roberta'].convert_tokens_to_ids(['<pad>'])[0]
+}
+
+mask_token_ids = {
+    'bert-base-uncased': tokenizers['bert-base-uncased'].convert_tokens_to_ids(['[MASK]'])[0],
+    'roberta': tokenizers['roberta'].convert_tokens_to_ids(['<mask>'])[0]
 }
 
 fragment_transforms = {
@@ -94,7 +100,36 @@ def pad_2d(array_2d, pad_value=0):
     return array_2d
 
 
-def GT_collate_fn(batch):
+def find_words_to_mask(sequence, mask_proportion):
+    words = []
+    for i, token in enumerate(sequence):
+        if token.startswith('<') and token.endswith('>'):
+            continue
+        elif token.startswith('Ġ') or token in '.,:;"?!' or not words:
+            words.append([i, 1])
+        else:
+            words[-1][1] += 1
+
+    num_to_mask = int(len(words) * mask_proportion)
+    words_to_mask = sorted(random.sample(words, num_to_mask))
+
+    return words_to_mask
+
+
+def mask_words(sequence, words_to_mask, mask_token_id, shift=0):
+    mask_ids = []
+    mask_targets = []
+    for start_idx, length in words_to_mask:
+        for i in range(length):
+            current_idx = start_idx + i + shift
+            mask_ids.append(current_idx)
+            mask_targets.append(sequence[current_idx])
+            sequence[current_idx] = mask_token_id
+
+    return mask_ids, mask_targets
+
+
+def GT_collate_fn(batch, mask_proportion):
     model_type = 'roberta'
 
     input_ids = []
@@ -104,8 +139,15 @@ def GT_collate_fn(batch):
     gap_ids = []
     target_gaps = []
 
+    mask_ids = []
+    mask_targets = []
+
     for text, fragment, target_gap in batch:
         text_sequence = text_transforms[model_type](text)
+
+        if mask_proportion > 0:
+            words_to_mask = find_words_to_mask(text_sequence, mask_proportion)
+
         text_sequence = tokenizers[model_type].convert_tokens_to_ids(text_sequence)
         fragment_sequence = fragment_transforms[model_type](fragment)
         fragment_sequence = tokenizers[model_type].convert_tokens_to_ids(fragment_sequence)
@@ -117,6 +159,11 @@ def GT_collate_fn(batch):
         gap_ids.append([i for i in range(len(full_sequence)) if full_sequence[i] == gap_token_ids[model_type]])
         target_gaps.append(target_gap)
 
+        if mask_proportion > 0:
+            current_mask_ids, current_mask_targets = mask_words(full_sequence, words_to_mask, mask_token_ids[model_type], shift=len(fragment_sequence))
+            mask_ids.append(current_mask_ids)
+            mask_targets.append(current_mask_targets)
+
     input_ids = torch.tensor(pad_2d(input_ids, pad_value=pad_token_ids[model_type]))
     token_type_ids = torch.tensor(pad_2d(token_type_ids, pad_value=1))
     attention_mask = torch.tensor(pad_2d(attention_mask))
@@ -124,5 +171,8 @@ def GT_collate_fn(batch):
     gap_ids = torch.tensor(gap_ids)
     target_gaps = torch.tensor(target_gaps)
 
-    return input_ids, token_type_ids, attention_mask, word_mask, gap_ids, target_gaps
+    mask_ids = torch.tensor([[row, col] for row, line in enumerate(mask_ids) for col in line])
+    mask_targets = torch.tensor([token_idx for line in mask_targets for token_idx in line])
+
+    return input_ids, token_type_ids, attention_mask, word_mask, gap_ids, target_gaps, mask_ids, mask_targets
 
