@@ -103,6 +103,10 @@ def get_args():
                         default=0,
                         type=float,
                         help='Proportion of words to mask in the input.')
+    parser.add_argument("--lm_weight",
+                        default=1,
+                        type=float,
+                        help='Weight of masked language model loss.')
     parser.add_argument("--local_rank",
                         type=int,
                         default=-1,
@@ -258,7 +262,7 @@ def train(args, log, tb_writer):
                 gt_loss_val += gt_loss.item()
                 lm_loss_val += lm_loss.item()
 
-                loss = gt_loss + lm_loss
+                loss = gt_loss + args.lm_weight * lm_loss
 
                 if args.fp16:
                     with amp.scale_loss(loss, optimizer) as scaled_loss:
