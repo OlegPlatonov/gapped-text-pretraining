@@ -59,7 +59,7 @@ text_transforms = {
 
 
 class GT_Dataset(data.Dataset):
-    def __init__(self, data_path, num_fragments=8):
+    def __init__(self, data_path, num_fragments=5):
         super(GT_Dataset, self).__init__()
         self.num_fragments = num_fragments
         self.data = dict()
@@ -115,7 +115,7 @@ def GT_collate_fn(batch):
         attention_mask.append([1 for _ in full_sequence])
         word_mask.append([1 if idx not in special_token_ids[model_type] else 0 for idx in full_sequence])
         gap_ids.append([i for i in range(len(full_sequence)) if full_sequence[i] == gap_token_ids[model_type]])
-        target_gaps.append(target_gap)
+        target_gaps.append(target_gap - 1)
 
     input_ids = torch.tensor(pad_2d(input_ids, pad_value=pad_token_ids[model_type]))
     token_type_ids = torch.tensor(pad_2d(token_type_ids, pad_value=1))

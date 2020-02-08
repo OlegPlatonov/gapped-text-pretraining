@@ -33,7 +33,6 @@ class GT_Head(nn.Module):
         device = sequence_output.device
 
         index_batch = torch.arange(batch_size).unsqueeze(1).to(device)
-        gap_ids = torch.cat([torch.zeros((batch_size, 1)).to(device).long(), gap_ids], dim=1)
         gaps = sequence_output[index_batch, gap_ids]
 
         gap_scores = self.features_2_scores(gaps).squeeze(-1)
