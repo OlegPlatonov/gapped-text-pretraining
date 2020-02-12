@@ -4,7 +4,7 @@ import torch.nn.functional as F
 
 from transformers.modeling_roberta import RobertaModel, RobertaLMHead
 from transformers.configuration_roberta import RobertaConfig
-from transformers.modeling_bert import BertPreTrainedModel
+from transformers.modeling_bert import BertPreTrainedModel, BertLayerNorm, gelu_new
 
 
 ROBERTA_PRETRAINED_MODEL_ARCHIVE_MAP = {
@@ -41,6 +41,33 @@ class GT_Head(nn.Module):
         return gap_scores
 
 
+class SimpleLayer(nn.Module):
+    def __init__(self, config, num_inputs):
+        super(SimpleLayer, self).__init__()
+        self.linear = nn.Linear(config.hidden_size * num_inputs, config.hidden_size)
+        self.LayerNorm = BertLayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+
+    def forward(self, features):
+        features = self.linear(features)
+        features = gelu_new(features)
+        features = self.LayerNorm(features)
+
+        return features
+
+
+class RobertaSpanHead(nn.Module):
+    def __init__(self, config):
+        super(RobertaSpanHead, self).__init__()
+        self.layer_1 = SimpleLayer(config, 3)
+        self.layer_2 = SimpleLayer(config, 1)
+
+    def forward(self, features):
+        features = self.layer_1(features)
+        features = self.layer_2(features)
+
+        return features
+
+
 class RobertaForGappedText(BertPreTrainedModel):
     config_class = RobertaConfig
     pretrained_model_archive_map = ROBERTA_PRETRAINED_MODEL_ARCHIVE_MAP
@@ -49,8 +76,10 @@ class RobertaForGappedText(BertPreTrainedModel):
     def __init__(self, config):
         super(RobertaForGappedText, self).__init__(config)
         self.roberta = RobertaModel(config)
-        self.sop_head = nn.Linear(config.hidden_size, 1)
+        self.span_head = RobertaSpanHead(config)
         self.lm_head = RobertaLMHead(config)
+
+        self.span_position_embeddings = nn.Embedding(300, config.hidden_size)
 
         self.init_weights()
 
@@ -59,7 +88,7 @@ class RobertaForGappedText(BertPreTrainedModel):
         input_ids,
         attention_mask,
         mask_ids,
-        sop_targets=None,
+        span_features,
         mask_targets=None
     ):
 
@@ -70,18 +99,21 @@ class RobertaForGappedText(BertPreTrainedModel):
 
         sequence_output = outputs[0]
 
-        cls_representations = sequence_output[:, 0]
-        sop_scores =  self.sop_head(cls_representations).squeeze(-1)
-
         mask_representations = sequence_output[mask_ids[:, 0], mask_ids[:, 1]]
         mask_scores = self.lm_head(mask_representations)
 
-        outputs = (sop_scores, mask_scores) + outputs[2:]
+        start_representations = sequence_output[span_features[:, 0], span_features[:, 1]]
+        end_representations = sequence_output[span_features[:, 0], span_features[:, 2]]
+        mask_position_embeddings = self.span_position_embeddings(span_features[:, 3])
+        span_features_new = self.span_head(torch.cat([start_representations, end_representations, mask_position_embeddings], dim=1))
+        span_scores = self.lm_head(span_features_new)
 
-        if mask_targets is not None and sop_targets is not None:
-            sop_loss = F.binary_cross_entropy_with_logits(input=sop_scores, target=sop_targets.half())
+        outputs = (span_scores, mask_scores) + outputs[2:]
+
+        if mask_targets is not None:
+            span_loss = F.cross_entropy(input=span_scores, target=mask_targets)
             lm_loss = F.cross_entropy(input=mask_scores, target=mask_targets)
 
-            outputs = (sop_loss, lm_loss) + outputs
+            outputs = (span_loss, lm_loss) + outputs
 
         return outputs

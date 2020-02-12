@@ -163,7 +163,7 @@ def train(args, log, tb_writer):
     # Get saver
     saver = CheckpointSaver(args.save_dir,
                             max_checkpoints=args.max_checkpoints,
-                            metric_name='SOP_accuracy',
+                            metric_name='span_accuracy',
                             maximize_metric=True,
                             log=log)
 
@@ -206,7 +206,25 @@ def train(args, log, tb_writer):
                              batch_size=args.batch_size,
                              sampler=dev_sampler,
                              num_workers=args.num_workers,
-                             collate_fn=lambda batch: GT_collate_fn(batch, args.mask_proportion))
+                             collate_fn=lambda batch: GT_collate_fn(batch, args.mask_proportion, logger=log))
+
+    if args.local_rank != -1:
+        torch.distributed.barrier()
+
+    # Get train data loader for current epoch
+    train_data_file_num = 1
+    train_data_file = os.path.join(args.data_dir, f'Epoch_{train_data_file_num}.csv')
+    log.info(f'Creating training dataset from {train_data_file}...')
+    train_dataset = GT_Dataset(train_data_file)
+    train_sampler = sampler(train_dataset)
+    train_loader = DataLoader(train_dataset,
+                              batch_size=args.batch_size,
+                              sampler=train_sampler,
+                              num_workers=args.num_workers,
+                              collate_fn=lambda batch: GT_collate_fn(batch, args.mask_proportion, logger=log))
+
+    if args.local_rank != -1:
+        torch.distributed.barrier()
 
 
     global_step = 0
@@ -216,52 +234,34 @@ def train(args, log, tb_writer):
     log.info('Training...')
     samples_till_eval = args.eval_every
     for epoch in range(1, args.num_epochs + 1):
-        if args.local_rank != -1:
-            torch.distributed.barrier()
-
-        # Get train data loader for current epoch
-        train_data_file_num = ((epoch - 1) % num_unique_data_epochs) + 1
-        train_data_file = os.path.join(args.data_dir, f'Epoch_{train_data_file_num}.csv')
-        log.info(f'Creating training dataset from {train_data_file}...')
-        train_dataset = GT_Dataset(train_data_file)
-        train_sampler = sampler(train_dataset)
-        train_loader = DataLoader(train_dataset,
-                                   batch_size=args.batch_size,
-                                   sampler=train_sampler,
-                                   num_workers=args.num_workers,
-                                   collate_fn=lambda batch: GT_collate_fn(batch, args.mask_proportion))
-
-        if args.local_rank != -1:
-            torch.distributed.barrier()
-
         log.info(f'Starting epoch {epoch}...')
         model.train()
         model.zero_grad()
-        sop_loss_val = 0
+        span_loss_val = 0
         lm_loss_val = 0
         with torch.enable_grad(), tqdm(total=len(train_loader.dataset), disable=args.local_rank not in [-1, 0]) as progress_bar:
             for step, batch in enumerate(train_loader, 1):
                 batch = tuple(x.to(device) for x in batch)
 
-                input_ids, token_type_ids, attention_mask, word_mask, sop_targets, mask_ids, mask_targets = batch
+                input_ids, token_type_ids, attention_mask, word_mask, mask_ids, span_features, mask_targets = batch
                 outputs = model(input_ids=input_ids,
                                 attention_mask=attention_mask,
                                 mask_ids=mask_ids,
-                                sop_targets=sop_targets,
+                                span_features=span_features,
                                 mask_targets=mask_targets)
 
                 current_batch_size = input_ids.shape[0]
 
-                sop_loss, lm_loss = outputs[:2]
+                span_loss, lm_loss = outputs[:2]
 
                 if args.accumulation_steps > 1:
-                    sop_loss = sop_loss / args.accumulation_steps
+                    span_loss = span_loss / args.accumulation_steps
                     lm_loss = lm_loss / args.accumulation_steps
 
-                sop_loss_val += sop_loss.item()
+                span_loss_val += span_loss.item()
                 lm_loss_val += lm_loss.item()
 
-                loss = sop_loss + args.lm_weight * lm_loss
+                loss = span_loss + args.lm_weight * lm_loss
 
                 if args.fp16:
                     with amp.scale_loss(loss, optimizer) as scaled_loss:
@@ -286,12 +286,12 @@ def train(args, log, tb_writer):
 
                     # Log info
                     current_lr = scheduler.get_lr()[0]
-                    progress_bar.set_postfix(epoch=epoch, sop_loss=sop_loss_val, lm_loss=lm_loss_val, step=global_step, lr=current_lr)
+                    progress_bar.set_postfix(epoch=epoch, span_loss=span_loss_val, lm_loss=lm_loss_val, step=global_step, lr=current_lr)
                     if args.local_rank in [-1, 0]:
-                        tb_writer.add_scalar('train/Loss', sop_loss_val, global_step)
+                        tb_writer.add_scalar('train/span_loss', span_loss_val, global_step)
                         tb_writer.add_scalar('train/LM_loss', lm_loss_val, global_step)
                         tb_writer.add_scalar('train/LR', current_lr, global_step)
-                    sop_loss_val = 0
+                    span_loss_val = 0
                     lm_loss_val = 0
 
                     if global_step == args.max_steps:
@@ -339,54 +339,53 @@ def evaluate_and_save(model, optimizer, data_loader, device, tb_writer, log, glo
         saver.save(step=global_step,
                    model=model,
                    args=args,
-                   metric_val=results['SOP_accuracy'])
+                   metric_val=results['span_accuracy'])
 
 
 def evaluate_GT(model, data_loader, device):
-    sop_loss_meter = AverageMeter()
+    span_loss_meter = AverageMeter()
     lm_loss_meter = AverageMeter()
     world_size = torch.distributed.get_world_size() if args.local_rank != -1 else 1
 
     model.eval()
-    correct_preds = 0
-    zero_preds = 0
-    total_preds = 0
+    correct_span_preds = 0
+    total_span_preds = 0
     correct_mask_preds = 0
     total_mask_preds = 0
     with torch.no_grad(), tqdm(total=len(data_loader.dataset), disable=args.local_rank not in [-1, 0]) as progress_bar:
         for batch in data_loader:
             batch = tuple(x.to(device) for x in batch)
-            input_ids, token_type_ids, attention_mask, word_mask, sop_targets, mask_ids, mask_targets = batch
+            input_ids, token_type_ids, attention_mask, word_mask, mask_ids, span_features, mask_targets = batch
             current_batch_size = input_ids.shape[0]
 
             outputs = model(input_ids=input_ids,
                             attention_mask=attention_mask,
                             mask_ids=mask_ids,
-                            sop_targets=sop_targets,
+                            span_features=span_features,
                             mask_targets=mask_targets)
 
-            sop_loss, lm_loss, sop_scores, mask_scores = outputs[:4]
-            sop_loss_meter.update(sop_loss.item(), current_batch_size)
+            span_loss, lm_loss, span_scores, mask_scores = outputs[:4]
+            span_loss_meter.update(span_loss.item(), span_scores.shape[0])
             lm_loss_meter.update(lm_loss.item(), mask_scores.shape[0])
 
-            preds = sop_scores > 0.5
-            correct_preds += torch.sum(preds == sop_targets).item()
-            zero_preds += torch.sum(preds == 0).item()
-            total_preds += current_batch_size
+            span_preds = torch.argmax(span_scores, dim=1)
+            correct_span_preds += torch.sum(span_preds == mask_targets).item()
+            total_span_preds += span_preds.shape[0]
 
             mask_preds = torch.argmax(mask_scores, dim=1)
             correct_mask_preds += torch.sum(mask_preds == mask_targets).item()
             total_mask_preds += mask_preds.shape[0]
 
+            assert total_span_preds == total_mask_preds
+
             # Log info
             progress_bar.update(current_batch_size * world_size)
-            progress_bar.set_postfix(sop_loss=sop_loss_meter.avg, lm_loss=lm_loss_meter.avg)
+            progress_bar.set_postfix(span_loss=span_loss_meter.avg, lm_loss=lm_loss_meter.avg)
 
     model.train()
 
-    results_list = [('SOP_loss', sop_loss_meter.avg),
-                    ('SOP_accuracy', correct_preds / total_preds),
-                    ('SOP_zero_share', zero_preds / total_preds),
+    results_list = [('span_loss', span_loss_meter.avg),
+                    ('span_accuracy', correct_span_preds / total_span_preds),
                     ('LM_loss', lm_loss_meter.avg),
                     ('LM_accuracy', correct_mask_preds / total_mask_preds)]
 

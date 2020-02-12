@@ -1,4 +1,5 @@
 import random
+import numpy as np
 import pandas as pd
 import torch
 import torch.utils.data as data
@@ -53,14 +54,9 @@ mask_token_ids = {
     'roberta': tokenizers['roberta'].convert_tokens_to_ids(['<mask>'])[0]
 }
 
-fragment_transforms = {
-    'bert-base-uncased': lambda fragment: ['[CLS]'] + fragment.split() + ['[SEP]'],
-    'roberta': lambda fragment: ['<s>'] + fragment.split() + ['</s>', '</s>']
-}
-
 text_transforms = {
-    'bert-base-uncased': lambda text: text.split() + ['[SEP]'],
-    'roberta': lambda text: text.split() + ['</s>']
+    'bert-base-uncased': lambda fragment: ['[CLS]'] + fragment.split() + ['[SEP]'],
+    'roberta': lambda fragment: ['<s>'] + fragment.split() + ['</s>']
 }
 
 
@@ -74,20 +70,12 @@ class GT_Dataset(data.Dataset):
                                                   dtype='str', engine='c'))
 
     def __len__(self):
-        return len(self.data['segment_1']) * 2
+        return len(self.data['segment_1'])
 
     def __getitem__(self, idx):
-        text_idx = idx // 2
-        swap = (idx % 2 == 1)
-
-        segment_1 = self.data['segment_1'][text_idx]
-        segment_2 = self.data['segment_2'][text_idx]
-        if swap:
-            segment_1, segment_2 = segment_2, segment_1
-
-        target_order = 0 if swap else 1
-
-        return segment_1, segment_2, target_order
+        segment_1 = self.data['segment_1'][idx]
+        segment_2 = self.data['segment_2'][idx]
+        return ' '.join([segment_1, segment_2])
 
 
 def pad_2d(array_2d, pad_value=0):
@@ -99,7 +87,19 @@ def pad_2d(array_2d, pad_value=0):
     return array_2d
 
 
-def find_words_to_mask(sequence, mask_proportion):
+def get_span_lengths(num_words, mask_proportion):
+    lengths = []
+    total_length = 0
+    while total_length < num_words * mask_proportion:
+        new_length = min([np.random.geometric(p=0.25, size=1)[0], 8])
+        lengths.append(new_length)
+        total_length += new_length
+
+    return lengths, total_length
+
+
+
+def find_words_to_mask(sequence, mask_proportion, logger):
     words = []
     prev_token_is_special = False
     for i, token in enumerate(sequence):
@@ -112,10 +112,41 @@ def find_words_to_mask(sequence, mask_proportion):
             if not prev_token_is_special:
                 words[-1][1] += 1
 
-    num_to_mask = int(len(words) * mask_proportion)
-    words_to_mask = sorted(random.sample(words, num_to_mask))
+    span_lengths, total_length = get_span_lengths(len(words), mask_proportion)
+    if total_length > len(words) // 2:
+        span_lengths = []
+        total_length = 0
+        logger.warning('Spans are to long! Will not use span masking for this example.')
 
-    return words_to_mask
+    num_options = len(words) - (total_length - len(span_lengths)) - len(span_lengths) * 2 - 2
+    span_start_indices = sorted(random.sample(list(range(num_options)), len(span_lengths)))
+    for i in reversed(range(1, len(span_start_indices))):
+        span_start_indices[i] -= span_start_indices[i - 1]
+
+    words_to_mask = []
+    span_features = []
+    current_id = 2
+    for i, start_idx in enumerate(span_start_indices):
+        current_id += start_idx
+
+        start_word_id = current_id
+        prev_token_id = words[current_id][0] - 1
+
+        for _ in range(span_lengths[i]):
+            words_to_mask.append(words[current_id])
+            current_id += 1
+
+        next_token_id = words[current_id][0]
+
+        token_position = 0
+        for word_id in range(start_word_id, current_id):
+            for _ in range(words[word_id][1]):
+                span_features.append([prev_token_id, next_token_id, token_position])
+                token_position += 1
+
+        current_id += 1
+
+    return words_to_mask, span_features
 
 
 def mask_words(sequence, words_to_mask, mask_token_id, shift=0):
@@ -131,46 +162,39 @@ def mask_words(sequence, words_to_mask, mask_token_id, shift=0):
     return mask_ids, mask_targets
 
 
-def GT_collate_fn(batch, mask_proportion):
+def GT_collate_fn(batch, mask_proportion, logger):
     model_type = 'roberta'
 
     input_ids = []
     token_type_ids = []
     attention_mask = []
     word_mask = []
-    sop_targets = []
     mask_ids = []
+    span_features = []
     mask_targets = []
 
-    for segment_1, segment_2, target_order in batch:
-        sequence_1 = fragment_transforms[model_type](segment_1)
-        words_to_mask_1 = find_words_to_mask(sequence_1, mask_proportion)
-        sequence_1 = tokenizers[model_type].convert_tokens_to_ids(sequence_1)
+    for segment in batch:
+        sequence = text_transforms[model_type](segment)
+        words_to_mask, current_span_features = find_words_to_mask(sequence, mask_proportion, logger)
+        sequence = tokenizers[model_type].convert_tokens_to_ids(sequence)
 
-        sequence_2 = text_transforms[model_type](segment_2)
-        words_to_mask_2 = find_words_to_mask(sequence_2, mask_proportion)
-        sequence_2 = tokenizers[model_type].convert_tokens_to_ids(sequence_2)
+        input_ids.append(sequence)
+        token_type_ids.append([0 for _ in sequence])
+        attention_mask.append([1 for _ in sequence])
+        word_mask.append([1 if idx not in special_token_ids[model_type] else 0 for idx in sequence])
 
-        full_sequence = sequence_1 + sequence_2
-
-        input_ids.append(full_sequence)
-        token_type_ids.append([0 for _ in range(len(sequence_1))] + [1 for _ in range(len(sequence_2))])
-        attention_mask.append([1 for _ in full_sequence])
-        word_mask.append([1 if idx not in special_token_ids[model_type] else 0 for idx in full_sequence])
-        sop_targets.append(target_order)
-
-        current_mask_ids_1, current_mask_targets_1 = mask_words(full_sequence, words_to_mask_1, mask_token_ids[model_type], shift=0)
-        current_mask_ids_2, current_mask_targets_2 = mask_words(full_sequence, words_to_mask_2, mask_token_ids[model_type], shift=len(sequence_1))
-        mask_ids.append(current_mask_ids_1 + current_mask_ids_2)
-        mask_targets.append(current_mask_targets_1 + current_mask_targets_2)
+        current_mask_ids, current_mask_targets = mask_words(sequence, words_to_mask, mask_token_ids[model_type], shift=0)
+        mask_ids.append(current_mask_ids)
+        span_features.append(current_span_features)
+        mask_targets.append(current_mask_targets)
 
     input_ids = torch.tensor(pad_2d(input_ids, pad_value=pad_token_ids[model_type]))
     token_type_ids = torch.tensor(pad_2d(token_type_ids, pad_value=1))
     attention_mask = torch.tensor(pad_2d(attention_mask))
     word_mask = torch.tensor(pad_2d(word_mask))
-    sop_targets = torch.tensor(sop_targets)
     mask_ids = torch.tensor([[row, col] for row, line in enumerate(mask_ids) for col in line])
+    span_features = torch.tensor([[row, prev_id, next_id, position] for row, line in enumerate(span_features) for prev_id, next_id, position in line])
     mask_targets = torch.tensor([token_idx for line in mask_targets for token_idx in line])
 
-    return input_ids, token_type_ids, attention_mask, word_mask, sop_targets, mask_ids, mask_targets
+    return input_ids, token_type_ids, attention_mask, word_mask, mask_ids, span_features, mask_targets
 
