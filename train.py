@@ -288,7 +288,7 @@ def train(args, log, tb_writer):
                     current_lr = scheduler.get_lr()[0]
                     progress_bar.set_postfix(epoch=epoch, sop_loss=sop_loss_val, lm_loss=lm_loss_val, step=global_step, lr=current_lr)
                     if args.local_rank in [-1, 0]:
-                        tb_writer.add_scalar('train/Loss', sop_loss_val, global_step)
+                        tb_writer.add_scalar('train/SOP_loss', sop_loss_val, global_step)
                         tb_writer.add_scalar('train/LM_loss', lm_loss_val, global_step)
                         tb_writer.add_scalar('train/LR', current_lr, global_step)
                     sop_loss_val = 0
