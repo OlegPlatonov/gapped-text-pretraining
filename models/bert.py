@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from transformers import RobertaModel
+from transformers.modeling_roberta import RobertaModel, RobertaLMHead
 from transformers.configuration_roberta import RobertaConfig
 from transformers.modeling_bert import BertPreTrainedModel
 
@@ -49,7 +49,8 @@ class RobertaForGappedText(BertPreTrainedModel):
     def __init__(self, config):
         super(RobertaForGappedText, self).__init__(config)
         self.roberta = RobertaModel(config)
-        self.gt_head = GT_Head(config.hidden_size)
+        self.sop_head = nn.Linear(config.hidden_size, 1)
+        self.lm_head = RobertaLMHead(config)
 
         self.init_weights()
 
@@ -57,8 +58,9 @@ class RobertaForGappedText(BertPreTrainedModel):
         self,
         input_ids,
         attention_mask,
-        gap_ids,
-        target_gaps=None,
+        mask_ids,
+        sop_targets=None,
+        mask_targets=None
     ):
 
         outputs = self.roberta(
@@ -68,12 +70,18 @@ class RobertaForGappedText(BertPreTrainedModel):
 
         sequence_output = outputs[0]
 
-        gap_scores = self.gt_head(sequence_output=sequence_output, gap_ids=gap_ids)
+        cls_representations = sequence_output[:, 0]
+        sop_scores =  self.sop_head(cls_representations).squeeze(-1)
 
-        outputs = (gap_scores,) + outputs[2:]
+        mask_representations = sequence_output[mask_ids[:, 0], mask_ids[:, 1]]
+        mask_scores = self.lm_head(mask_representations)
 
-        if target_gaps is not None:
-            loss = F.cross_entropy(input=gap_scores, target=target_gaps)
-            outputs = (loss,) + outputs
+        outputs = (sop_scores, mask_scores) + outputs[2:]
+
+        if mask_targets is not None and sop_targets is not None:
+            sop_loss = F.binary_cross_entropy_with_logits(input=sop_scores, target=sop_targets.half())
+            lm_loss = F.cross_entropy(input=mask_scores, target=mask_targets)
+
+            outputs = (sop_loss, lm_loss) + outputs
 
         return outputs

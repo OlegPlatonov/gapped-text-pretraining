@@ -1,3 +1,4 @@
+import random
 import pandas as pd
 import torch
 import torch.utils.data as data
@@ -18,8 +19,8 @@ tokenizers = {
 }
 
 special_tokens = {
-    'bert-base-uncased': ['[PAD]', '[UNK]', '[CLS]', '[SEP]', '[MASK]', '[GAP]'],
-    'roberta': ['<s>', '<pad>', '</s>', '<unk>', '<mask>', '<gap>']
+    'bert-base-uncased': ['[PAD]', '[UNK]', '[CLS]', '[SEP]', '[GAP]'],
+    'roberta': ['<s>', '<pad>', '</s>', '<unk>', '<gap>']
 }
 
 special_token_ids = {
@@ -47,6 +48,11 @@ pad_token_ids = {
     'roberta': tokenizers['roberta'].convert_tokens_to_ids(['<pad>'])[0]
 }
 
+mask_token_ids = {
+    'bert-base-uncased': tokenizers['bert-base-uncased'].convert_tokens_to_ids(['[MASK]'])[0],
+    'roberta': tokenizers['roberta'].convert_tokens_to_ids(['<mask>'])[0]
+}
+
 fragment_transforms = {
     'bert-base-uncased': lambda fragment: ['[CLS]'] + fragment.split() + ['[SEP]'],
     'roberta': lambda fragment: ['<s>'] + fragment.split() + ['</s>', '</s>']
@@ -59,30 +65,29 @@ text_transforms = {
 
 
 class GT_Dataset(data.Dataset):
-    def __init__(self, data_path, num_fragments=8):
+    def __init__(self, data_path):
         super(GT_Dataset, self).__init__()
-        self.num_fragments = num_fragments
         self.data = dict()
-        self.data['text'] = list(pd.read_csv(data_path, usecols=['text'], squeeze=True,
-                                             dtype='str', engine='c'))
-        for i in range(1, num_fragments + 1):
-            self.data[f'fragment_{i}'] = list(pd.read_csv(data_path, usecols=[f'fragment_{i}'], squeeze=True,
-                                                          dtype='str', engine='c'))
-            self.data[f'target_gap_{i}'] = list(pd.read_csv(data_path, usecols=[f'target_gap_{i}'], squeeze=True,
-                                                            dtype='int', engine='c'))
+        self.data['segment_1'] = list(pd.read_csv(data_path, usecols=['segment_1'], squeeze=True,
+                                                  dtype='str', engine='c'))
+        self.data['segment_2'] = list(pd.read_csv(data_path, usecols=['segment_2'], squeeze=True,
+                                                  dtype='str', engine='c'))
 
     def __len__(self):
-        return len(self.data['text']) * self.num_fragments
+        return len(self.data['segment_1']) * 2
 
     def __getitem__(self, idx):
-        text_idx = idx // self.num_fragments
-        fragment_idx = idx % self.num_fragments + 1
+        text_idx = idx // 2
+        swap = (idx % 2 == 1)
 
-        text = self.data['text'][text_idx]
-        fragment = self.data[f'fragment_{fragment_idx}'][text_idx]
-        target_gap = self.data[f'target_gap_{fragment_idx}'][text_idx]
+        segment_1 = self.data['segment_1'][text_idx]
+        segment_2 = self.data['segment_2'][text_idx]
+        if swap:
+            segment_1, segment_2 = segment_2, segment_1
 
-        return text, fragment, target_gap
+        target_order = 0 if swap else 1
+
+        return segment_1, segment_2, target_order
 
 
 def pad_2d(array_2d, pad_value=0):
@@ -94,35 +99,78 @@ def pad_2d(array_2d, pad_value=0):
     return array_2d
 
 
-def GT_collate_fn(batch):
+def find_words_to_mask(sequence, mask_proportion):
+    words = []
+    prev_token_is_special = False
+    for i, token in enumerate(sequence):
+        if token.startswith('<') and token.endswith('>'):
+            prev_token_is_special = True
+        elif token.startswith('Ġ') or token in '.,:;"?!' or not words:
+            words.append([i, 1])
+            prev_token_is_special = False
+        else:
+            if not prev_token_is_special:
+                words[-1][1] += 1
+
+    num_to_mask = int(len(words) * mask_proportion)
+    words_to_mask = sorted(random.sample(words, num_to_mask))
+
+    return words_to_mask
+
+
+def mask_words(sequence, words_to_mask, mask_token_id, shift=0):
+    mask_ids = []
+    mask_targets = []
+    for start_idx, length in words_to_mask:
+        for i in range(length):
+            current_idx = start_idx + i + shift
+            mask_ids.append(current_idx)
+            mask_targets.append(sequence[current_idx])
+            sequence[current_idx] = mask_token_id
+
+    return mask_ids, mask_targets
+
+
+def GT_collate_fn(batch, mask_proportion):
     model_type = 'roberta'
 
     input_ids = []
     token_type_ids = []
     attention_mask = []
     word_mask = []
-    gap_ids = []
-    target_gaps = []
+    sop_targets = []
+    mask_ids = []
+    mask_targets = []
 
-    for text, fragment, target_gap in batch:
-        text_sequence = text_transforms[model_type](text)
-        text_sequence = tokenizers[model_type].convert_tokens_to_ids(text_sequence)
-        fragment_sequence = fragment_transforms[model_type](fragment)
-        fragment_sequence = tokenizers[model_type].convert_tokens_to_ids(fragment_sequence)
-        full_sequence = fragment_sequence + text_sequence
+    for segment_1, segment_2, target_order in batch:
+        sequence_1 = fragment_transforms[model_type](segment_1)
+        words_to_mask_1 = find_words_to_mask(sequence_1, mask_proportion)
+        sequence_1 = tokenizers[model_type].convert_tokens_to_ids(sequence_1)
+
+        sequence_2 = text_transforms[model_type](segment_2)
+        words_to_mask_2 = find_words_to_mask(sequence_2, mask_proportion)
+        sequence_2 = tokenizers[model_type].convert_tokens_to_ids(sequence_2)
+
+        full_sequence = sequence_1 + sequence_2
+
         input_ids.append(full_sequence)
-        token_type_ids.append([0 for _ in range(len(fragment_sequence))] + [1 for _ in range(len(text_sequence))])
+        token_type_ids.append([0 for _ in range(len(sequence_1))] + [1 for _ in range(len(sequence_2))])
         attention_mask.append([1 for _ in full_sequence])
         word_mask.append([1 if idx not in special_token_ids[model_type] else 0 for idx in full_sequence])
-        gap_ids.append([i for i in range(len(full_sequence)) if full_sequence[i] == gap_token_ids[model_type]])
-        target_gaps.append(target_gap)
+        sop_targets.append(target_order)
+
+        current_mask_ids_1, current_mask_targets_1 = mask_words(full_sequence, words_to_mask_1, mask_token_ids[model_type], shift=0)
+        current_mask_ids_2, current_mask_targets_2 = mask_words(full_sequence, words_to_mask_2, mask_token_ids[model_type], shift=len(sequence_1))
+        mask_ids.append(current_mask_ids_1 + current_mask_ids_2)
+        mask_targets.append(current_mask_targets_1 + current_mask_targets_2)
 
     input_ids = torch.tensor(pad_2d(input_ids, pad_value=pad_token_ids[model_type]))
     token_type_ids = torch.tensor(pad_2d(token_type_ids, pad_value=1))
     attention_mask = torch.tensor(pad_2d(attention_mask))
     word_mask = torch.tensor(pad_2d(word_mask))
-    gap_ids = torch.tensor(gap_ids)
-    target_gaps = torch.tensor(target_gaps)
+    sop_targets = torch.tensor(sop_targets)
+    mask_ids = torch.tensor([[row, col] for row, line in enumerate(mask_ids) for col in line])
+    mask_targets = torch.tensor([token_idx for line in mask_targets for token_idx in line])
 
-    return input_ids, token_type_ids, attention_mask, word_mask, gap_ids, target_gaps
+    return input_ids, token_type_ids, attention_mask, word_mask, sop_targets, mask_ids, mask_targets
 
