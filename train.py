@@ -369,7 +369,7 @@ def evaluate_GT(model, data_loader, device):
             sop_loss_meter.update(sop_loss.item(), current_batch_size)
             lm_loss_meter.update(lm_loss.item(), mask_scores.shape[0])
 
-            preds = sop_scores > 0.5
+            preds = (sop_scores > 0.5).long()
             correct_preds += torch.sum(preds == sop_targets).item()
             zero_preds += torch.sum(preds == 0).item()
             total_preds += current_batch_size
