@@ -3,7 +3,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 from torch.nn.parallel import DistributedDataParallel
-from transformers import AdamW, get_linear_schedule_with_warmup
+from transformers import AdamW, get_linear_schedule_with_warmup, AutoTokenizer
 from apex import amp
 
 import os
@@ -34,10 +34,14 @@ def get_args():
                         type=str,
                         default='roberta-base',
                         help='Pretrained model name or path.')
+    parser.add_argument('--tokenizer',
+                        type=str,
+                        default='',
+                        help='Tokenizer name or path. If empty, model name or path will be used.')
     parser.add_argument('--task',
                         type=str,
                         default='GT',
-                        choices=['GT', 'QA'],
+                        choices=['GT', 'QA', 'MLM'],
                         help='Training task name.')
     parser.add_argument('--save_dir',
                         type=str,
@@ -46,6 +50,9 @@ def get_args():
     parser.add_argument('--data_dir',
                         type=str,
                         default='./data/GT')
+    parser.add_argument('--preprocessing_config',
+                        type=str,
+                        default=None)
     parser.add_argument('--seed',
                         type=int,
                         default=12)
@@ -62,6 +69,10 @@ def get_args():
                         type=lambda s: s.lower().startswith('t'),
                         default=False,
                         help='Whether to use 16-bit float precision instead of 32-bit')
+    parser.add_argument('--apex_level',
+                        default='O1',
+                        choices=['O0', 'O1', 'O2', 'O3'],
+                        help='Apex optimization level. Only used if fp16 is True.')
     parser.add_argument('--num_epochs',
                         type=int,
                         default=1)
@@ -80,18 +91,18 @@ def get_args():
     parser.add_argument('--max_checkpoints',
                         type=int,
                         default=30)
-    parser.add_argument('--eval_every',
+    parser.add_argument('--save_every',
                         type=int,
-                        default=50000,
-                        help='Evaluate model after processing this many training samples.')
-    parser.add_argument('--eval_after_epoch',
+                        default=100000,
+                        help='Save model after processing this many training samples..')
+    parser.add_argument('--save_after_epoch',
                         type=lambda s: s.lower().startswith('t'),
                         default=True,
-                        help='Whether to evaluate model at the end of every epoch.')
-    parser.add_argument('--apex_level',
-                        default='O1',
-                        choices=['O0', 'O1', 'O2', 'O3'],
-                        help='Apex optimization level. Only used if fp16 is True.')
+                        help='Whether to save model at the end of every epoch.')
+    parser.add_argument('--evaluate',
+                        type=lambda s: s.lower().startswith('t'),
+                        default=True,
+                        help='Whether to evaluate model before saving.')
     parser.add_argument("--weight_decay",
                         default=0.0,
                         type=float)
@@ -113,7 +124,7 @@ def train(args, logger, tb_writer):
 
     device_id = args.local_rank if args.local_rank != -1 else 0
     device = torch.device('cuda', device_id)
-    logger.warning(f'Using GPU {args.local_rank}.')
+    logger.warning(f'Using GPU {device_id}.')
 
     world_size = torch.distributed.get_world_size() if args.local_rank != -1 else 1
     logger.info(f'Total number of GPUs used: {world_size}.')
@@ -123,8 +134,8 @@ def train(args, logger, tb_writer):
     num_train_samples_per_epoch, num_dev_samples, num_unique_train_epochs = get_data_sizes(data_dir=args.data_dir,
                                                                                            num_epochs=args.num_epochs,
                                                                                            logger=logger)
-    num_optimization_steps = sum(num_train_samples_per_epoch) // world_size // args.batch_size // \
-                             args.accumulation_steps
+    num_optimization_steps = (sum(num_train_samples_per_epoch) // world_size // args.batch_size //
+                              args.accumulation_steps)
     if args.max_steps > 0:
         num_optimization_steps = min(num_optimization_steps, args.max_steps)
     logger.info(f'Total number of optimization steps: {num_optimization_steps}.')
@@ -178,29 +189,34 @@ def train(args, logger, tb_writer):
                                         output_device=args.local_rank,
                                         find_unused_parameters=True)
 
-    # Get dev data loader
-    dev_data_file = os.path.join(args.data_dir, f'dev.jsonl.gz')
-    logger.info(f'Creating dev dataset from {dev_data_file}...')
-    dev_dataset = DatasetRegistry.get_dataset(args.task)(data_file=dev_data_file,
-                                                         data_size=num_dev_samples,
-                                                         local_rank=-1)
-    dev_loader = DataLoader(dev_dataset,
-                            batch_size=2 * args.batch_size,
-                            num_workers=1,
-                            collate_fn=dev_dataset.collate_fn)
+    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer if args.tokenizer else args.model)
 
-    # Get evaluator
-    evaluator = EvaluatorRegistry.get_evaluator(args.task)(data_loader=dev_loader,
-                                                           logger=logger,
-                                                           tb_writer=tb_writer,
-                                                           device=device,
-                                                           world_size=world_size,
-                                                           args=args)
+    if args.evaluate:
+        # Get dev data loader
+        dev_data_file = os.path.join(args.data_dir, f'dev.jsonl.gz')
+        logger.info(f'Creating dev dataset from {dev_data_file}...')
+        dev_dataset = DatasetRegistry.get_dataset(args.task)(data_file=dev_data_file,
+                                                             data_size=num_dev_samples,
+                                                             tokenizer=tokenizer,
+                                                             preprocessing_config=args.preprocessing_config,
+                                                             local_rank=-1)
+        dev_loader = DataLoader(dev_dataset,
+                                batch_size=2 * args.batch_size,
+                                num_workers=1,
+                                collate_fn=dev_dataset.collate_fn)
+
+        # Get evaluator
+        evaluator = EvaluatorRegistry.get_evaluator(args.task)(data_loader=dev_loader,
+                                                               logger=logger,
+                                                               tb_writer=tb_writer,
+                                                               device=device,
+                                                               world_size=world_size,
+                                                               args=args)
 
     # Get saver
     saver = CheckpointSaver(save_dir=args.save_dir,
                             max_checkpoints=args.max_checkpoints,
-                            primary_metric=evaluator.primary_metric,
+                            primary_metric=evaluator.primary_metric if args.evaluate else None,
                             logger=logger)
 
     global_step = 0
@@ -208,7 +224,7 @@ def train(args, logger, tb_writer):
 
     # Train
     logger.info('Training...')
-    samples_till_eval = args.eval_every
+    samples_till_save = args.save_every
     for epoch in range(1, args.num_epochs + 1):
         # Get train data loader for current epoch
         train_data_file_num = ((epoch - 1) % num_unique_train_epochs) + 1
@@ -217,6 +233,8 @@ def train(args, logger, tb_writer):
         train_dataset = DatasetRegistry.get_dataset(args.task)(train_data_file,
                                                                data_size=num_train_samples_per_epoch[epoch - 1],
                                                                local_rank=args.local_rank,
+                                                               tokenizer=tokenizer,
+                                                               preprocessing_config=args.preprocessing_config,
                                                                world_size=world_size)
         train_loader = DataLoader(train_dataset,
                                   batch_size=args.batch_size,
@@ -248,7 +266,7 @@ def train(args, logger, tb_writer):
                     loss.backward()
 
                 samples_processed += current_batch_size * world_size
-                samples_till_eval -= current_batch_size * world_size
+                samples_till_save -= current_batch_size * world_size
                 progress_bar.update(current_batch_size * world_size)
 
                 if step % args.accumulation_steps == 0:
@@ -275,14 +293,14 @@ def train(args, logger, tb_writer):
                         logger.info('Reached maximum number of optimization steps.')
                         break
 
-                    if samples_till_eval <= 0:
-                        samples_till_eval = args.eval_every
-                        eval_results = evaluator.evaluate(model, global_step)
+                    if samples_till_save <= 0:
+                        samples_till_save = args.save_every
+                        eval_results = evaluator.evaluate(model, global_step) if args.evaluate else None
                         if args.local_rank in [-1, 0]:
                             saver.save(model, global_step, eval_results)
 
-            if args.eval_after_epoch:
-                eval_results = evaluator.evaluate(model, global_step)
+            if args.save_after_epoch:
+                eval_results = evaluator.evaluate(model, global_step) if args.evaluate else None
                 if args.local_rank in [-1, 0]:
                     saver.save(model, global_step, eval_results)
 

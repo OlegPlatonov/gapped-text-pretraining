@@ -4,9 +4,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from transformers.modeling_roberta import RobertaModel, ROBERTA_PRETRAINED_MODEL_ARCHIVE_MAP
+from transformers.modeling_roberta import RobertaModel
 from transformers.configuration_roberta import RobertaConfig
-from transformers.modeling_bert import BertPreTrainedModel
+from transformers.modeling_bert import BertPreTrainedModel, BertModel, BertOnlyMLMHead
+from transformers.configuration_bert import BertConfig
 
 
 class ModelRegistry(ABCMeta):
@@ -28,7 +29,6 @@ class BaseModel(ABC, BertPreTrainedModel, metaclass=ModelRegistry):
 
 class RobertaForGT(BaseModel):
     config_class = RobertaConfig
-    pretrained_model_archive_map = ROBERTA_PRETRAINED_MODEL_ARCHIVE_MAP
     base_model_prefix = 'roberta'
     task = 'GT'
 
@@ -75,7 +75,6 @@ class RobertaForGT(BaseModel):
 
 class RobertaForQA(BaseModel):
     config_class = RobertaConfig
-    pretrained_model_archive_map = ROBERTA_PRETRAINED_MODEL_ARCHIVE_MAP
     base_model_prefix = 'roberta'
     task = 'QA'
 
@@ -116,5 +115,48 @@ class RobertaForQA(BaseModel):
 
             all_losses = {'Start_Loss': start_loss.item(), 'End_Loss': end_loss.item()}
             outputs = (loss, all_losses) + outputs
+
+        return outputs
+
+
+class BertForMLM(BaseModel):
+    config_class = BertConfig
+    base_model_prefix = 'bert'
+    task = 'MLM'
+
+    def __init__(self, config):
+        super(BertForMLM, self).__init__(config)
+        self.bert = BertModel(config)
+        self.cls = BertOnlyMLMHead(config)
+
+        self.init_weights()
+
+    def forward(
+        self,
+        input_ids,
+        attention_mask,
+        mask_ids=None,
+        mask_targets=None
+    ):
+
+        outputs = self.bert(
+            input_ids,
+            attention_mask=attention_mask
+        )
+
+        sequence_output = outputs.last_hidden_state
+
+        if mask_ids is None:
+            return self.cls(sequence_output)
+
+        mask_representations = sequence_output[mask_ids[:, 0], mask_ids[:, 1]]
+        mask_scores = self.cls(mask_representations)
+
+        if mask_targets is None:
+            return mask_scores
+
+        loss = F.cross_entropy(input=mask_scores, target=mask_targets)
+        all_losses = {'loss': loss.item()}
+        outputs = (loss, all_losses)
 
         return outputs

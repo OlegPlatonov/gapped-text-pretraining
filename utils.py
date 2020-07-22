@@ -71,7 +71,7 @@ class CheckpointSaver:
     """
     Adapted from https://github.com/chrischute/squad.
     """
-    def __init__(self, save_dir, max_checkpoints, primary_metric,
+    def __init__(self, save_dir, max_checkpoints, primary_metric=None,
                  maximize_metric=True, logger=None):
         super(CheckpointSaver, self).__init__()
 
@@ -82,7 +82,8 @@ class CheckpointSaver:
         self.best_val = None
         self.ckpt_paths = queue.PriorityQueue()
         self.logger = logger
-        self._print(f'Saver will {"max" if maximize_metric else "min"}imize {primary_metric}.')
+        if primary_metric is not None:
+            self._print(f'Saver will {"max" if maximize_metric else "min"}imize {primary_metric}.')
 
     def is_best(self, metric_val):
         if metric_val is None:
@@ -105,7 +106,7 @@ class CheckpointSaver:
         if hasattr(model, 'module'):
             model = model.module
 
-        metric_val = eval_results[self.primary_metric]
+        metric_val = eval_results[self.primary_metric] if eval_results is not None else None
 
         checkpoint_path = os.path.join(self.save_dir, f'model_step_{step}.bin')
         torch.save(model.state_dict(), checkpoint_path)
@@ -131,7 +132,9 @@ class CheckpointSaver:
             self._print(f'{best_path} is now checkpoint from step {step}.')
 
         # Add checkpoint path to priority queue (lowest priority removed first)
-        if self.maximize_metric:
+        if self.primary_metric is None:
+            priority_order = step
+        elif self.maximize_metric:
             priority_order = metric_val
         else:
             priority_order = -metric_val
@@ -192,7 +195,7 @@ def get_data_sizes(data_dir, num_epochs, logger=None):
     config_file = os.path.join(data_dir, f'data_config.yaml')
     with open(config_file, 'r') as file:
         config = yaml.safe_load(file)
-        num_dev_samples = config['dev_size']
+        num_dev_samples = config['dev_size'] if 'dev_size' in config else None
         for epoch in range(1, num_epochs + 1):
             if f'epoch_{epoch}_size' in config:
                 num_train_samples_per_epoch.append(config[f'epoch_{epoch}_size'])
